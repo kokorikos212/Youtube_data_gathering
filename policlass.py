@@ -1,14 +1,25 @@
 import sqlite3 as sql 
 from pytube import Playlist, YouTube
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from itertools import cycle
+import re
 import os 
 import time 
 import sys 
-from googleapiclient.discovery import build
+#
+import re
+from urllib.parse import urlparse, parse_qs
+from contextlib import suppress
+
+from requests.auth import HTTPProxyAuth
+import requests
+
+import traceback
+import linecache
 
 global api_key
-api_key = 'YOUR API KEY'
-
-
+api_key = 'AIzaSyBEkZLUCSWmSXFZMPAFnm3o28-VRglFS5E'
 
 class Database:
     def __init__(self) -> None:
@@ -38,7 +49,8 @@ class Database:
                 playlist_title TEXT,
                 playlist_length TEXT,
                 playlist_link TEXT,
-                related_channel_id INTEGER,  -- Reference the correct column name here
+                playlist_publish_date TEXT,
+                related_channel_id INTEGER,
                 FOREIGN KEY (related_channel_id) REFERENCES Channels (related_channel_id)
             )
         ''')
@@ -94,8 +106,8 @@ class Database:
             return None
 
 class Save_data:
-    def __init__(self) -> None:
-        pass
+    def __init__(self, proxy_rotator) :
+        self.proxy_rotator = proxy_rotator
 
     def Save_video_data(self, video_data, database, relational_key):
         """
@@ -123,6 +135,7 @@ class Save_data:
         connection.commit()
         connection.close() 
 
+
     def Save_playlist(self, url, database, related_channel_id):
         """
         Save playlist details to the database.
@@ -132,26 +145,32 @@ class Save_data:
         - database (str): The path or connection information for the database.
         - related_channel_id (int): The ID of the related channel in the database.
         """
-        print("__Save_playlist__")
-        # Create playlist_ object
+        print(f"__Save_playlist__{url}")
+        proxies = self.proxy_rotator.get_next_proxy()
+        #Create a playlist object to work with 
+        playlist_obj = Playlist(url, proxies=proxies)
         try:
-            playlist_obj = Playlist(url)
+            # Initialise the youtube api handler
+            api_inst = YouTubeAPIHandler(api_key) 
             # get the necessary data and create a tuple to store
             playlist_title = playlist_obj.title
+
             playlist_length = len(playlist_obj.video_urls)
+            playlist_publish_date = api_inst.get_playlist_publish_date(url)
             print(f"__Playlist length = {playlist_length}__")      
-         
-            playlist_data = (playlist_title, playlist_length, url) 
+            # The is the whole data in a tuple to insert them to the database
+            playlist_data = (playlist_title, playlist_length, url, playlist_publish_date) 
 
             # save the data 
             connection = sql.connect(database)
             cursor = connection.cursor()
             # Save the data of the playlist
             cursor.execute('''
-                INSERT INTO Playlists (playlist_title, playlist_length, playlist_link) VALUES (?,?,?)''', playlist_data)
+                INSERT INTO Playlists (playlist_title, playlist_length, playlist_link, playlist_publish_date) VALUES (?,?,?,?)''', playlist_data)
             # Save the relaitions between new Playlist and the coresponding Channel 
             # Retrieve the playlist_id of the last inserted row in the playlists table
             # Get the last playlist_id from the Playlists table
+            
             playlist_id = Database().get_last_row_id_for_table(cursor, "Playlists")
 
             # Save the relationship between the new Playlist and the corresponding Channel
@@ -160,15 +179,19 @@ class Save_data:
             connection.commit()
             connection.close()
         except Exception as e:
-            print(e)
+            # Print exception details and the line where it occurred
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            line_number = exc_tb.tb_lineno
+            line_content = linecache.getline(fname, line_number)
+            return 
+
 
         # Now we need to iterate through all the videos of the playlist and store the data of each one of them in a relaitional way as parts of the above playlist
-        count = 0
-        for video_url in playlist_obj.video_urls: 
-            count+=1 
-            print(count) 
+        playlist_urls = playlist_obj.video_urls
+        for i, video_url in enumerate(playlist_urls): 
+            print(f"Processing video #{i + 1}: {video_url}")
             video_data = self.get_video_data(video_url)
-            # lastrowid = Database().get_last_row_id_for_table( cursor, "")
             relational_key = (related_channel_id, playlist_id)
             self.Save_video_data(video_data, database, relational_key)
 
@@ -195,25 +218,24 @@ class Save_data:
         print(f'Channel "{channel_data[0]}" details have been saved!')
 
 class Extract_data_url(Save_data):
-    def __init__(self)-> None:
-        super().__init__()
+    def __init__(self, proxy_rotator):
+        super().__init__(proxy_rotator)
+        self.proxy_rotator = proxy_rotator
 
     def get_yt_id(self, url, ignore_playlist=False):
-        import re
-        from urllib.parse import urlparse, parse_qs
-        from contextlib import suppress
 
         query = urlparse(url)
         if query.hostname == 'youtu.be': return query.path[1:]
         if query.hostname in {'www.youtube.com', 'youtube.com', 'music.youtube.com'}:
             if not ignore_playlist:
-            # use case: get playlist id not current video in playlist
+                # use case: get playlist id not current video in playlist
                 with suppress(KeyError):
                     return parse_qs(query.query)['list'][0]
             if query.path == '/watch': return parse_qs(query.query)['v'][0]
             if query.path[:7] == '/watch/': return query.path.split('/')[1]
             if query.path[:7] == '/embed/': return query.path.split('/')[2]
             if query.path[:3] == '/v/': return query.path.split('/')[2]
+
 
     def get_likes_dislikes(self, url):
         """Takes in the a youtube video url and returns the counter of likes and dislikes if they available. """
@@ -251,9 +273,10 @@ class Extract_data_url(Save_data):
     
     def get_video_data(self, url):
         print("__get_video_data__")
+        proxies = self.proxy_rotator.get_next_proxy()
         try:
             # Create a YouTube object
-            video = YouTube(url)
+            video = YouTube(url, proxies=proxies)
 
             # Get the video details
             title = str(video.title)
@@ -269,9 +292,7 @@ class Extract_data_url(Save_data):
             video_data = (title, author, views, length, likes, dislikes ,publish_date, url)
             return video_data
         except Exception as e:
-            print("Error") 
-            print(e) 
-            return None 
+            print(f"Caught an exception of type {type(e).__name__} with message: {e}")
 
     def getSave_channel_details(self, yt_channel_id, database): 
         """
@@ -301,7 +322,7 @@ class Extract_data_url(Save_data):
         except KeyError:
             print(f'View count information not available for the channel {channel_title}.')
         channel_data = (channel_title, publish_date, view_count )
-        Save_data().Save_channel_details(channel_data, database)
+        Save_data(self.proxy_rotator).Save_channel_details(channel_data, database)
 
     def get_all_playlist_from_channel(self, yt_channel_id):# Here the yt_channel_id refears to youtube channel ids
         youtube = build('youtube', 'v3', developerKey=api_key)
@@ -349,14 +370,15 @@ class Extract_data_url(Save_data):
         print("__get_playlist_data__")
 
         def get_single_playlist_data(playlist_url, database):
+            proxies = self.proxy_rotator.get_next_proxy()
             # SAve the playlist to the database with the function Save_playlist
             self.Save_playlist(playlist_url, database, related_channel_id)
             # Create a Playlist object to work with
-            playlist = Playlist(playlist_url)
+            playlist = Playlist(playlist_url,proxies=proxies)  
             # Iterate through the videos in the playlist and get details
             for video_url in playlist.video_urls:
                 try:
-                    video = YouTube(video_url)           
+                    video = YouTube(video_url, proxies=proxies)           
                     # Get the video details
                     title = video.title
                     author = video.author
@@ -368,7 +390,6 @@ class Extract_data_url(Save_data):
                     publish_date = video.publish_date
 
                     video_data = (title, author, views, length,likes, dislikes ,publish_date, video_url)
-                    print(video_data)
                     cursor = sql.Connection(database).cursor()
                     playlist_id = Database().get_last_row_id_for_table(cursor, "Playlists")
                     relational_key = (related_channel_id, playlist_id)
@@ -379,40 +400,137 @@ class Extract_data_url(Save_data):
                     print(e)
                     
 
-        try: # If we have many playlist urls in the urls parameter we are going to call several time the grt_single_playlist_data 
-            len_urls = len(urls) 
-            for url in urls:
-                print("loop of saving data of playlist")
+        # try: # If we have many playlist urls in the urls parameter we are going to call several times the grt_single_playlist_data
+        if len(urls)>1:
+            print("_multiple urls_") 
+            
+            for i,url in enumerate(urls):
+                print(f"playlist {i+1}") 
                 get_single_playlist_data(url, database) 
             return
-        except:
+        else:
             get_single_playlist_data(urls, database)
+    
 
-# Create nd database 
-# nd_database = "nd_data.db"
-# Create poli big database
-# try_channels = "try_channels.db" 
-# Save_data.create_database(try_channels)
-# Extract_inst = Extract_data_url()
-# snippet = ("UCuyKcrRBIz28qF2IqC3T4Cw", try_channels, "Channels")
-# Extract_inst.getSave_channel_details( snippet[0], snippet[1], snippet[2])
+class YouTubeAPIHandler:
+    def __init__(self, api_key):
+        self.youtube = build('youtube', 'v3', developerKey=api_key)
 
-# sys.exit() 
+    def get_playlist_publish_date(self, playlist_url):
+        # Extract playlist ID from URL
+        playlist_id_match = re.search(r'list=([a-zA-Z0-9_-]+)', playlist_url)
+        if not playlist_id_match:
+            print("Invalid playlist URL")
+            return None
+
+        playlist_id = playlist_id_match.group(1)
+
+        try:
+            # Use YouTube Data API to get playlist information
+            playlist_response = self.youtube.playlists().list(
+                part='snippet',
+                id=playlist_id
+            ).execute()
+
+            if 'items' in playlist_response and playlist_response['items']:
+                playlist = playlist_response['items'][0]['snippet']
+                publish_date = playlist['publishedAt']
+                return publish_date
+            else:
+                print("Playlist not found or no publish date available.")
+                return None
+
+        except HttpError as e:
+            print(f"Error fetching playlist information: {e}")
+            return None
+
+class ProxyRotator:
+    def __init__(self, proxies, max_attempts=10, validation_url='http://www.example.com'):
+        self.proxies = cycle(proxies)
+        self.max_attempts = max_attempts
+        self.validation_url = validation_url
+
+    def _is_proxy_valid(self, proxy):
+        try:
+            # If proxy is a dictionary, assume it's already in the correct format
+            if isinstance(proxy, dict):
+                proxies_dict = proxy
+            else:
+                # If proxy is a string, convert it to the format expected by Pytube
+                proxy_url = f'http://{proxy}'
+                proxies_dict = {'http': proxy_url, 'https': proxy_url}
+
+            # Attempt a request using the proxy to check if it's valid
+            response = requests.get(self.validation_url, proxies=proxies_dict)
+            response.raise_for_status()  # Check for HTTP errors
+
+            return True
+
+        except requests.RequestException as e:
+            print(f"Error with proxy {proxy}: {e}")
+            return False
+
+    def get_next_proxy(self):
+        attempts = 0
+        while attempts < self.max_attempts:
+            proxy_string = next(self.proxies)
+            ip_port, username, password = self.extract_ip_port(proxy_string)
+            proxy_with_auth = self.add_proxy_auth(ip_port, username=username, password=password)
+            if self._is_proxy_valid(proxy_with_auth):
+                return proxy_with_auth
+            attempts += 1
+
+        raise ValueError(f"Unable to find a valid proxy after {self.max_attempts} attempts.")
 
 
-yt_channel_ids = [
-    "UCC5GG5tZf0APYlBbzup9J9A",
-    "UCN_lRCj-sCu9HZvSz-TxikA",
-    "UCuyKcrRBIz28qF2IqC3T4Cw",
-]
+    def extract_ip_port(self, proxy_string):
+        """
+        Extracts the IP address, port, username, and password from a proxy string.
+        """
+        parts = proxy_string.split(':')
+        
+        if len(parts) != 4:
+            raise ValueError("Invalid proxy string format.")
+        
+        ip_port = ':'.join(parts[:2])
+        username = parts[2]
+        password = parts[3]
+        
+        return ip_port, username, password
 
-def get_big_data(yt_channel_ids, database):
-    Extract_inst = Extract_data_url()
+    def add_proxy_auth(self, ip_port, username, password):
+        """
+        Adds authentication details to a proxy URL.
+        """
+        proxy_url1 = f'http://{username}:{password}@{ip_port}'
+        proxy_url2 = f'https://{username}:{password}@{ip_port}'
+
+        return {'http': proxy_url1, 'https': proxy_url2}
+
+
+yt_channel_ids = ['UCZ5e8t-YR8woifcKACklYlg', 
+               'UCX61UWb7DM67b4fAr2GbkHQ', 
+               'UCC5GG5tZf0APYlBbzup9J9A', 
+               'UCFo8lg0X1IleQMz_pe1IWAw', 
+               'UCMepEkZu9_HFYNGteSao3TQ', 
+               'UCuyKcrRBIz28qF2IqC3T4Cw', 
+               'UCD6MnmHvLtTY_fBDt7yoXSA', 
+               'UCxkRFoGbP4wV6hLTYuRagWw', 
+               'UCwnIhLT9GvoXSvT7udzs3Dg', 
+               'UCJkuXSz3IIBir_IkHSyQ-2w', 
+               'UC8dsz9dtUvIf7HqP5jrC_Jw', 
+               'UCG_zxydHuzlhgO4yquCOsjQ', 
+               'UC_wSXkcCtfqvuFcmhGWTBEg', 
+               'UCv9nYfzw8QxHGkk7Zstfdqg']
+
+
+def get_big_data(yt_channel_ids, database, proxy_rotator):
+    Extract_inst = Extract_data_url(proxy_rotator)
     connection = sql.connect(database)
     cursor = connection.cursor()
     
     for yt_channel_id in yt_channel_ids:
-        time.sleep(10) 
+        # time.sleep(10) 
         count=0
         try:
             Extract_inst.getSave_channel_details(yt_channel_id, database) # Append the channel to the database 
@@ -420,7 +538,7 @@ def get_big_data(yt_channel_ids, database):
             print(f" Number of playlists in the channel = {len(urls_of_partyi)}. ")
         except Exception as e:
             print(e) 
-            time.sleep(20)
+            # time.sleep(20)
 
         try:
             related_channel_id = Database().get_last_row_id_for_table(cursor, "Channels") # retreive the relational key of the channel in the database
@@ -432,53 +550,16 @@ def get_big_data(yt_channel_ids, database):
     print("Fuck yes man you nailed it!!!") 
     return 
 
-poli_full_db = "poli_full1.db"
-nd_database = "nd_database.db"
-Extract_inst = Extract_data_url()
+poli_full_db = "proxy_foull.db"
 
 if __name__ == "__main__":
     # Database.create_database(poli_full_db) 
     # sys.exit()
+    proxy_file_path = "/home/thinpan/Desktop/py/portfolio_proj/Political/Free_Proxy_List2.txt"
+    # Read proxies from the file
+    with open(proxy_file_path) as f:
+        proxies = [line.strip() for line in f]
 
-    get_big_data(yt_channel_ids, poli_full_db)
-
-    # yt_channel_id = "UCuyKcrRBIz28qF2IqC3T4Cw"
-    # playlists = Extract_inst.get_all_playlist_from_channel(yt_channel_id)
-    # print(len(playlists) )
-    # conn = sql.Connection(nd_database) 
-    # cursor = conn.cursor()
-
-    # Extract_data_url().getSave_channel_details(yt_channel_id, nd_database)
-    # related_channel_id = Database().get_last_row_id_for_table(cursor, "Channels") 
-    # Extract_inst.getSave_playlists_data(playlists, nd_database, related_channel_id)
-
-# "UCG_zxydHuzlhgO4yquCOsjQ",
-#     "UCZ5e8t-YR8woifcKACklYlg",
-#     "UCJkuXSz3IIBir_IkHSyQ-2w",
-#     "UC_wSXkcCtfqvuFcmhGWTBEg",
-#     "UC5XLm_i_Bflbhc-xPzQoQdA"]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    proxy_inst = ProxyRotator(proxies)
+    Extract_inst = Extract_data_url(proxy_inst)
+    get_big_data(yt_channel_ids, poli_full_db,  proxy_inst)

@@ -19,7 +19,7 @@ import traceback
 import linecache
 
 global api_key
-api_key = 'AIzaSyBEkZLUCSWmSXFZMPAFnm3o28-VRglFS5E'
+api_key = "YOUR API KEY'
 
 class Database:
     def __init__(self) -> None:
